@@ -1,15 +1,17 @@
 import csv
 import os
 from typing import List
-from typing_extensions import TypedDict
+from langchain_aws import BedrockEmbeddings
 from langchain_core.documents import Document
 from langchain_core.tools import tool
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
-from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import InMemoryVectorStore
 from dotenv import load_dotenv
 from langchain.agents import create_agent
+# from bedrock_agentcore.runtime import BedrockAgentCoreApp
+
+# app = BedrockAgentCoreApp()
 
 _ = load_dotenv()
 
@@ -26,12 +28,45 @@ def load_faq_csv(path: str) -> List[Document]:
 
 
 docs = load_faq_csv("./opus_qna.csv")
-emb = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2",
-)
 splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=0)
 chunks = splitter.split_documents(docs)
-store = FAISS.from_documents(chunks, emb)
+emb = BedrockEmbeddings(model_id="amazon.titan-embed-text-v1")
+
+import time
+from botocore.exceptions import ClientError
+
+def safe_embed_batch(texts, batch_size=5):
+    all_vectors = []
+
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+
+        for attempt in range(5):
+            try:
+                vectors = emb.embed_documents(batch)
+                all_vectors.extend(vectors)
+                break
+            except ClientError as e:
+                if "ThrottlingException" in str(e):
+                    wait = 2 ** attempt
+                    print(f"Batch throttled... retrying in {wait}s")
+                    time.sleep(wait)
+                else:
+                    raise
+
+        time.sleep(1)
+
+    return all_vectors
+
+texts = [doc.page_content for doc in chunks]
+
+vectors = safe_embed_batch(texts, batch_size=5)
+
+store = InMemoryVectorStore.from_embeddings(
+    texts=texts,
+    embeddings=vectors
+)
+# store = InMemoryVectorStore.from_documents(chunks, embedding=emb)
 
 @tool
 def search_faq(query: str) -> str:
@@ -137,12 +172,27 @@ agent = create_agent(
     system_prompt=system_prompt
 )
 
+# @app.entrypoint
+# def agent_invocation(payload, context):
+#     print("Received payload: ", payload)
+#     print("Context: ", context)
+
+#     query = payload.get("prompt", "No prompt found in input")
+
+#     result = agent.invoke({"messages": [("human", query)]})
+#     print("Result:", result)
+
+#     return {"result": result['messages'][-1].content}
+
 if __name__ == "__main__":
+
+    # app.run()      
+
     result = agent.invoke({"messages": [("human", "Tell me about the brand.")]})
     print(result['messages'][-1].content)
 
-    # for step in agent.stream(
-    # {"messages": [("human", "Tell me about the brand.")]},
-    # stream_mode="values"
-    # ):
-    #     print(step)
+    # # for step in agent.stream(
+    # # {"messages": [("human", "Tell me about the brand.")]},
+    # # stream_mode="values"
+    # # ):
+    # #     print(step)
